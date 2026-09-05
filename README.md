@@ -97,7 +97,7 @@ Window identity comes from `windowDurationMins`, not primary/secondary position.
 
 ## Refresh and missing data
 
-Checks each provider at most once every **15 minutes**, plus up to one minute of jitter. Opening the popover only displays data. Manual refresh and CLI diagnostics share the same persistent gate and cannot bypass a rate-limit cooldown. A local timer updates the display once per minute without making a request unless a provider is due.
+Checks each provider at most once every **15 minutes**, plus up to one minute of jitter. Opening the popover only displays data. The **Refresh** button fetches immediately without waiting for the automatic interval (at most once per minute). Rate-limit cooldowns still apply, and the button explains which providers are waiting. CLI diagnostics use the automatic schedule. All requests share a persistent gate, including across processes. A local timer updates the display once per minute without making a request unless a provider is due.
 
 For HTTP 429, retries back off to **30 minutes → 60 minutes → 2 hours**, capped at two hours for subsequent failures. A longer `Retry-After` response is always respected (both seconds and HTTP dates are supported). Missing, invalid, or zero headers never cause an immediate retry. Other failures back off from 15 minutes up to two hours. A successful response resets the backoff. Schedules survive app restarts in `~/Library/Application Support/UsageMonitor/polling.json`; a file lock prevents duplicate requests from multiple app/CLI processes.
 

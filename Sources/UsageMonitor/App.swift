@@ -15,17 +15,26 @@ import ServiceManagement
             Task { @MainActor in self.refresh() }
         }
     }
-    func refresh(allowKeychainPrompt: Bool = false) {
+    func refresh(allowKeychainPrompt: Bool = false, manual: Bool = false) {
         now = Date()
         guard !refreshing else { return }
         let due = providers.contains { ($0.nextAttempt ?? .distantPast) <= now }
-        guard due || (allowKeychainPrompt && providers.contains { $0.needsKeychainAccess }) else { return }
+        guard due || manual || (allowKeychainPrompt && providers.contains { $0.needsKeychainAccess }) else { return }
         refreshing = true
         Task {
-            async let codex = Task.detached(priority: .utility) { await readProvider("Codex") }.value
-            async let claude = Task.detached(priority: .utility) { await readProvider("Claude", allowKeychainPrompt: allowKeychainPrompt) }.value
+            async let codex = Task.detached(priority: .utility) { await readProvider("Codex", manual: manual) }.value
+            async let claude = Task.detached(priority: .utility) { await readProvider("Claude", allowKeychainPrompt: allowKeychainPrompt, manual: manual) }.value
             let fetched = await [codex, claude]
             providers = zip(fetched, providers).map { keepingLastReading($0.0, previous: $0.1) }
+            if manual {
+                let refreshed = fetched.filter { !$0.skipped }.map(\.name)
+                let waiting = fetched.filter(\.skipped).map(\.name)
+                if refreshed.isEmpty {
+                    message = "Still waiting: \(waiting.joined(separator: ", ")). Rate-limit cooldowns stay in effect; other manual checks are limited to once a minute."
+                } else if !waiting.isEmpty {
+                    message = "Checked \(refreshed.joined(separator: ", ")). \(waiting.joined(separator: ", ")) is waiting to retry."
+                } else { message = "Checked both providers at \(Date().formatted(.dateTime.hour().minute()))." }
+            }
             refreshing = false
         }
     }
@@ -161,8 +170,12 @@ struct MonitorView: View {
                 Text("Usage").font(.system(size: 12, weight: .semibold))
                 Spacer()
                 Text("Used · resets in").font(.system(size: 10)).foregroundStyle(.secondary)
-                Button { monitor.refresh(allowKeychainPrompt: true) } label: { Image(systemName: "arrow.clockwise").font(.system(size: 11)) }
-                    .buttonStyle(.borderless).disabled(monitor.refreshing).help("Refresh usage").accessibilityLabel("Refresh usage")
+                Button { monitor.refresh(allowKeychainPrompt: true, manual: true) } label: {
+                    Label(monitor.refreshing ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise")
+                        .font(.system(size: 11))
+                }
+                    .buttonStyle(.borderless).disabled(monitor.refreshing)
+                    .help("Refresh now. Rate-limit cooldowns still apply.").accessibilityLabel("Refresh usage now")
             }
             Divider()
             ProviderCard(provider: monitor.providers[0])

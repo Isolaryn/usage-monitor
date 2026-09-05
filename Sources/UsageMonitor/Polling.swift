@@ -6,9 +6,28 @@ struct PollSchedule: Codable {
     var nextAttempt = Date.distantPast
     var failures = 0
     var lastError: String?
+    var lastAttempt: Date?
+    var inFlightUntil: Date?
+    var rateLimitUntil: Date?
+
+    mutating func reserve(now: Date, manual: Bool, repair: Bool = false) -> Bool {
+        guard (inFlightUntil ?? .distantPast) <= now else { return false }
+        // Older schedule files encode a rate-limit cooldown in lastError/nextAttempt.
+        let legacyLimit = lastError == ClaudeUsageError.rateLimited.errorDescription ? nextAttempt : nil
+        guard (rateLimitUntil ?? legacyLimit ?? .distantPast) <= now else { return false }
+        let manualDue = manual && now.timeIntervalSince(lastAttempt ?? .distantPast) >= 60
+        guard isDue(at: now) || manualDue || repair else { return false }
+        lastAttempt = now
+        inFlightUntil = now.addingTimeInterval(60)
+        nextAttempt = now.addingTimeInterval(Self.interval)
+        lastError = nil
+        return true
+    }
 
     func isDue(at now: Date) -> Bool { now >= nextAttempt }
     mutating func record(_ result: ProviderSnapshot, now: Date, jitter: TimeInterval = 0) {
+        inFlightUntil = nil
+        rateLimitUntil = nil
         if result.observed != nil {
             failures = 0
             lastError = nil
@@ -19,6 +38,7 @@ struct PollSchedule: Codable {
             let delay = min(2 * 60 * 60, base * pow(2, Double(failures - 1)))
             nextAttempt = max(now.addingTimeInterval(delay + max(0, jitter)), result.retryAfter ?? now)
             lastError = result.status
+            if result.rateLimited { rateLimitUntil = nextAttempt }
         }
     }
 }
@@ -53,15 +73,13 @@ func updateSchedules<T>(directory: URL = support, _ action: (inout [String: Poll
     try JSONEncoder().encode(schedules).write(to: url, options: .atomic)
     return result
 }
-func readProvider(_ name: String, allowKeychainPrompt: Bool = false) async -> ProviderSnapshot {
+func readProvider(_ name: String, allowKeychainPrompt: Bool = false, manual: Bool = false) async -> ProviderSnapshot {
     do {
         let reservation = try updateSchedules { schedules -> (Bool, PollSchedule) in
             var schedule = schedules[name] ?? PollSchedule()
             // Keychain repair is local, but can only bypass the gate for that error.
             let repair = allowKeychainPrompt && schedule.lastError == ClaudeUsageError.keychainLocked.errorDescription
-            guard schedule.isDue(at: Date()) || repair else { return (false, schedule) }
-            schedule.nextAttempt = Date().addingTimeInterval(PollSchedule.interval)
-            schedule.lastError = nil // Reserve once, including concurrent Keychain repair requests.
+            guard schedule.reserve(now: Date(), manual: manual, repair: repair) else { return (false, schedule) }
             schedules[name] = schedule
             return (true, schedule)
         }
@@ -69,7 +87,9 @@ func readProvider(_ name: String, allowKeychainPrompt: Bool = false) async -> Pr
             var result = ProviderSnapshot(name: name)
             result.skipped = true
             result.nextAttempt = reservation.1.nextAttempt
-            result.status = reservation.1.lastError ?? "Waiting for scheduled check"
+            result.status = reservation.1.lastError == ClaudeUsageError.rateLimited.errorDescription
+                ? "Waiting to retry after earlier rate limit"
+                : reservation.1.lastError ?? "Waiting for scheduled check"
             result.needsKeychainAccess = reservation.1.lastError == ClaudeUsageError.keychainLocked.errorDescription
             return result
         }
@@ -94,6 +114,10 @@ func keepingLastReading(_ result: ProviderSnapshot, previous: ProviderSnapshot) 
     if result.skipped, previous.observed != nil || previous.nextAttempt != nil {
         var retained = previous
         retained.nextAttempt = result.nextAttempt
+        if result.status == "Waiting to retry after earlier rate limit" {
+            retained.status = result.status
+            retained.isStale = retained.observed != nil
+        }
         return retained
     }
     var result = result
