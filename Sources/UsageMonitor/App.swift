@@ -6,6 +6,7 @@ import ServiceManagement
     @Published var providers = [ProviderSnapshot(name: "Codex"), ProviderSnapshot(name: "Claude")]
     @Published var refreshing = false
     @Published var message: String?
+    @Published var now = Date()
     private var timer: Timer?
     init() {
         refresh()
@@ -15,11 +16,17 @@ import ServiceManagement
         }
     }
     func refresh(allowKeychainPrompt: Bool = false) {
-        guard !refreshing else { return }; refreshing = true
+        now = Date()
+        guard !refreshing else { return }
+        let due = providers.contains { ($0.nextAttempt ?? .distantPast) <= now }
+        guard due || (allowKeychainPrompt && providers.contains { $0.needsKeychainAccess }) else { return }
+        refreshing = true
         Task {
-            async let codex = Task.detached(priority: .utility) { readCodex() }.value
-            async let claude = Task.detached(priority: .utility) { await readClaude(allowKeychainPrompt: allowKeychainPrompt) }.value
-            providers = await [codex, claude]; refreshing = false
+            async let codex = Task.detached(priority: .utility) { await readProvider("Codex") }.value
+            async let claude = Task.detached(priority: .utility) { await readProvider("Claude", allowKeychainPrompt: allowKeychainPrompt) }.value
+            let fetched = await [codex, claude]
+            providers = zip(fetched, providers).map { keepingLastReading($0.0, previous: $0.1) }
+            refreshing = false
         }
     }
     var menuDescription: String {
@@ -31,9 +38,10 @@ import ServiceManagement
         }.joined(separator: "; ")
     }
     func menuValue(_ provider: ProviderSnapshot, period: UsagePeriod) -> String {
-        guard let observed = provider.observed, Date().timeIntervalSince(observed) < 300,
+        guard let observed = provider.observed,
               let window = provider.windows.first(where: { $0.period == period }) else { return "—" }
-        return "\(window.usedPercent)%"
+        let stale = provider.isStale || Date().timeIntervalSince(observed) > PollSchedule.interval + 120
+        return "\(stale ? "~" : "")\(window.usedPercent)%"
     }
     var menuImage: NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
@@ -130,8 +138,16 @@ struct ProviderCard: View {
             ForEach(displayedPeriods(provider), id: \.self) { period in
                 UsageRow(period: period, window: provider.windows.first { $0.period == period }, tint: tint)
             }
-            if provider.observed == nil || provider.windows.isEmpty {
+            if provider.observed == nil || provider.windows.isEmpty || provider.isStale {
                 Text(provider.status).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if provider.isStale, let observed = provider.observed {
+                Text("Last reading \(observed.formatted(.relative(presentation: .numeric)))")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            if let next = provider.nextAttempt {
+                Text("Next check \(next.formatted(.dateTime.hour().minute()))")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         }
     }
@@ -159,7 +175,7 @@ struct MonitorView: View {
             if let message = monitor.message { Text(message).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             Divider()
             HStack {
-                Text(monitor.refreshing ? "Refreshing…" : "Auto-refresh · 1 min").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(monitor.refreshing ? "Refreshing…" : "Auto-refresh · 15 min").font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
                 Menu {
                     Text("Menu bar: 5-hour / weekly % used")
@@ -178,8 +194,8 @@ struct MonitorView: View {
 func runDiagnostics() {
     let done = DispatchSemaphore(value: 0)
     Task.detached {
-        let codex = readCodex()
-        let claude = await readClaude(allowKeychainPrompt: CommandLine.arguments.contains("--allow-keychain"))
+        let codex = await readProvider("Codex")
+        let claude = await readProvider("Claude", allowKeychainPrompt: CommandLine.arguments.contains("--allow-keychain"))
         for provider in [codex, claude] {
             print("\(provider.name): installed=\(provider.installed), signedIn=\(provider.signedIn), status=\(provider.status)")
             for period in UsagePeriod.allCases {

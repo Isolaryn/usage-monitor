@@ -32,5 +32,54 @@ func runTests() {
     precondition(tokenFromCredentials(Data(#"{"claudeAiOauth":{"accessToken":"fixture-only"}}"#.utf8)) == "fixture-only")
     precondition(tokenFromCredentials(Data(#"{"mcpOAuth":{}}"#.utf8)) == nil)
     precondition(shellQuote("a'b") == "'a'\\''b'")
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    var throttled = ProviderSnapshot(name: "Claude")
+    throttled.rateLimited = true
+    throttled.status = "Rate limited"
+    var schedule = PollSchedule()
+    precondition(schedule.isDue(at: now))
+    for delay in [1800.0, 3600, 7200, 7200] {
+        schedule.record(throttled, now: now)
+        precondition(schedule.nextAttempt == now.addingTimeInterval(delay))
+        precondition(!schedule.isDue(at: now.addingTimeInterval(delay - 1)))
+        precondition(schedule.isDue(at: now.addingTimeInterval(delay)))
+    }
+    precondition(retryAfterDate("120", now: now) == now.addingTimeInterval(120))
+    precondition(retryAfterDate("Wed, 21 Oct 2015 07:28:00 GMT", now: now) == Date(timeIntervalSince1970: 1445412480))
+    precondition(retryAfterDate("invalid", now: now) == nil)
+    precondition(retryAfterDate("-1", now: now) == nil)
+    precondition(retryAfterDate("inf", now: now) == nil)
+    throttled.retryAfter = now.addingTimeInterval(10_000)
+    schedule.record(throttled, now: now)
+    precondition(schedule.nextAttempt == throttled.retryAfter)
+    throttled.retryAfter = retryAfterDate("0", now: now)
+    schedule.record(throttled, now: now)
+    precondition(schedule.nextAttempt == now.addingTimeInterval(7200))
+    var good = ProviderSnapshot(name: "Claude")
+    good.observed = now
+    good.identity = "fixture-account"
+    good.windows = claude
+    schedule.record(good, now: now, jitter: 60)
+    precondition(schedule.failures == 0 && schedule.lastError == nil)
+    precondition(schedule.nextAttempt == now.addingTimeInterval(960))
+    throttled.identity = good.identity
+    let retained = keepingLastReading(throttled, previous: good)
+    precondition(retained.isStale && retained.windows.count == 2 && retained.observed == now)
+    throttled.identity = "different-account"
+    precondition(keepingLastReading(throttled, previous: good).windows.isEmpty)
+    var emptySuccess = good
+    emptySuccess.windows = []
+    precondition(keepingLastReading(emptySuccess, previous: good).windows.isEmpty)
+    var unavailable = ProviderSnapshot(name: "Codex")
+    unavailable.status = "Unavailable"
+    schedule = PollSchedule()
+    schedule.record(unavailable, now: now)
+    precondition(schedule.nextAttempt == now.addingTimeInterval(900))
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try! updateSchedules(directory: directory) { $0["Claude"] = schedule }
+    let restored = try! updateSchedules(directory: directory) { $0["Claude"]! }
+    precondition(restored.nextAttempt == schedule.nextAttempt && !restored.isDue(at: now))
+    print("Passed: polling cadence, exponential backoff, Retry-After, cooldown persistence and stale account isolation")
     print("Passed: window identity, both providers, ISO dates, missing/malformed windows, clamping, credential shape and quoting")
 }

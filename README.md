@@ -81,7 +81,7 @@ Both build paths share `Resources/Info.plist`.
 
 ## Claude: local token, no status-line plugin
 
-The monitor reads the existing Claude subscription token from `CLAUDE_CODE_OAUTH_TOKEN`, the configured Claude credential file, or the named `Claude Code-credentials` macOS Keychain item. It sends that token only to Anthropic's HTTPS OAuth usage endpoint. Requests use an ephemeral session, do not follow redirects, and do not persist tokens, responses, cookies, or account identities. It does not rotate or overwrite Claude's credentials.
+The monitor reads the existing Claude subscription token from `CLAUDE_CODE_OAUTH_TOKEN`, the configured Claude credential file, or the named `Claude Code-credentials` macOS Keychain item. It sends that token only to Anthropic's HTTPS OAuth usage endpoint. Requests use an ephemeral session, do not follow redirects, and do not persist tokens, usage responses, cookies, or account identities. Only polling deadlines, failure counts, and controlled error messages are saved locally. It does not rotate or overwrite Claude's credentials.
 
 The Keychain is queried for the specific Claude item, never enumerated. Background checks cannot prompt. If macOS requires authorization, use **Allow Claude Keychain access…** or the refresh button. macOS can request access again after Claude rotates credentials or this locally signed application is rebuilt.
 
@@ -97,7 +97,13 @@ Window identity comes from `windowDurationMins`, not primary/secondary position.
 
 ## Refresh and missing data
 
-Checks once per minute and on manual refresh, with bounded network/process requests. Both providers are fetched independently. Failed fetches clear live values and show the reason. Old values are not retained as current. Menu bar readings older than five minutes show dashes. Reset countdowns do not invent renewed quota. Hover a usage row to see the absolute reset time.
+Checks each provider at most once every **15 minutes**, plus up to one minute of jitter. Opening the popover only displays data. Manual refresh and CLI diagnostics share the same persistent gate and cannot bypass a rate-limit cooldown. A local timer updates the display once per minute without making a request unless a provider is due.
+
+For HTTP 429, retries back off to **30 minutes → 60 minutes → 2 hours**, capped at two hours for subsequent failures. A longer `Retry-After` response is always respected (both seconds and HTTP dates are supported). Missing, invalid, or zero headers never cause an immediate retry. Other failures back off from 15 minutes up to two hours. A successful response resets the backoff. Schedules survive app restarts in `~/Library/Application Support/UsageMonitor/polling.json`; a file lock prevents duplicate requests from multiple app/CLI processes.
+
+Last successful readings are kept in memory during a failure for the same account identity, labelled with their age and a `~` prefix in the menu bar. Each provider shows its next check time. A successful response that omits the 5-hour window still hides that row. No stale usage is loaded from disk or carried over to a different account token. Reset countdowns do not invent renewed quota.
+
+There is no published request quota established here for Claude's OAuth usage endpoint; 15 minutes is a conservative app policy, not a guaranteed safe provider limit. For comparison, [CodexBar's adaptive policy](https://github.com/steipete/CodexBar/blob/main/Sources/AdaptiveRefreshCore/AdaptiveRefreshPolicyCore.swift) uses a nominal five minutes and 15–30 minutes while idle. [Its OAuth cooldown](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/Providers/Claude/ClaudeOAuth/ClaudeOAuthUsageRateLimitGate.swift) also honors `Retry-After`. Anthropic documents that header for its [public API](https://platform.claude.com/docs/en/api/rate-limits), whose inference limits should not be assumed to apply to this usage endpoint.
 
 ## Previous status-line integration
 

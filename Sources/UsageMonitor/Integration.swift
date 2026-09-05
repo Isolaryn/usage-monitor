@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import Security
 import LocalAuthentication
+import CryptoKit
 
 typealias JSON = [String: Any]
 let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/UsageMonitor")
@@ -62,6 +63,12 @@ struct ProviderSnapshot {
     var windows: [WindowUsage] = []
     var observed: Date?
     var needsKeychainAccess = false
+    var rateLimited = false
+    var retryAfter: Date?
+    var nextAttempt: Date?
+    var skipped = false
+    var isStale = false
+    var identity: String?
 }
 final class Command {
     let process = Process()
@@ -101,7 +108,7 @@ final class Command {
         throw NSError(domain: "Provider unavailable or timed out", code: 3)
     }
 }
-func readCodex() -> ProviderSnapshot {
+func fetchCodex() -> ProviderSnapshot {
     var state = ProviderSnapshot(name: "Codex")
     guard let path = executable("codex") else { state.status = "Install Codex CLI to connect"; return state }
     state.installed = true
@@ -113,6 +120,7 @@ func readCodex() -> ProviderSnapshot {
         try rpc.send(["id": 2, "method": "account/read", "params": ["refreshToken": false]])
         let account = try rpc.response(2)["account"] as? JSON
         guard let account else { state.status = "Sign in with codex login"; return state }
+        state.identity = (try? encode(account)).map { SHA256.hash(data: $0).description }
         state.signedIn = true; state.plan = account["planType"] as? String ?? account["type"] as? String ?? ""
         try rpc.send(["id": 3, "method": "account/rateLimits/read"])
         let limits = try rpc.response(3)
@@ -168,7 +176,7 @@ func claudeToken(allowKeychainPrompt: Bool) throws -> String {
 final class NoRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
-func readClaude(allowKeychainPrompt: Bool = false) async -> ProviderSnapshot {
+func fetchClaude(allowKeychainPrompt: Bool = false) async -> ProviderSnapshot {
     var state = ProviderSnapshot(name: "Claude")
     state.installed = executable("claude") != nil || FileManager.default.fileExists(atPath: "/Applications/Claude.app") || FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Claude.app").path)
     // CLI status distinguishes a login problem from a usage-fetch problem.
@@ -180,6 +188,7 @@ func readClaude(allowKeychainPrompt: Bool = false) async -> ProviderSnapshot {
     }
     do {
         let token = try claudeToken(allowKeychainPrompt: allowKeychainPrompt)
+        state.identity = SHA256.hash(data: Data(token.utf8)).description
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 20
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
@@ -197,7 +206,10 @@ func readClaude(allowKeychainPrompt: Bool = false) async -> ProviderSnapshot {
         case 200: break
         case 401: throw ClaudeUsageError.expired
         case 403: throw ClaudeUsageError.forbidden
-        case 429: throw ClaudeUsageError.rateLimited
+        case 429:
+            state.rateLimited = true
+            state.retryAfter = retryAfterDate(response.value(forHTTPHeaderField: "Retry-After"))
+            throw ClaudeUsageError.rateLimited
         default: throw ClaudeUsageError.http(response.statusCode)
         }
         let payload = decode(data)
